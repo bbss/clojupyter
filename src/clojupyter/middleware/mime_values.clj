@@ -1,7 +1,8 @@
 (ns clojupyter.middleware.mime-values
   (:require [clojure.tools.nrepl.transport :as t]
             [clojupyter.protocol.mime-convertible :as mime]
-            [clojure.tools.nrepl.middleware.pr-values])
+            [clojure.tools.nrepl.middleware.pr-values]
+            [clojure.tools.nrepl.middleware.session])
   (:use [clojure.tools.nrepl.middleware :only (set-descriptor!)])
   (:import clojure.tools.nrepl.transport.Transport))
 
@@ -24,3 +25,24 @@
                  {:requires #{#'clojure.tools.nrepl.middleware.pr-values/pr-values}
                   :expects #{"eval"}
                   :handles {}})
+
+(defn transform-code-with-cljsc-context [code cljsc-context]
+  code)
+
+(defn wrap-transform-code-with-cljsc-context [handler]
+  (fn [{:keys [op ^Transport transport] :as msg}]
+    (handler (-> msg
+                 (update :code (fn [code] (transform-code-with-cljsc-context
+                                           code (:cljsc msg))))
+                 (assoc :transport
+                        (reify Transport
+                          (recv [this] (.recv transport))
+                          (recv [this timeout] (.recv transport timeout))
+                          (send [this {:keys [value] :as resp}]
+                            (.send transport
+                                   resp))))))))
+
+(set-descriptor! #'clojupyter.middleware.mime-values/wrap-transform-code-with-cljsc-context
+                 {:requires #{#'clojure.tools.nrepl.middleware.session/session}
+                  :expects #{"eval"}
+                  })

@@ -16,7 +16,16 @@
             [clojure.walk :as walk]
             [taoensso.timbre :as log]
             [zeromq.zmq :as zmq])
+  (:import [java.net ServerSocket])
   (:gen-class :main true))
+
+(defn get-free-port!
+  "Get a free port. Problem?: might be taken before I use it."
+  []
+  (let [socket (ServerSocket. 0)
+        port (.getLocalPort socket)]
+    (.close socket)
+    port))
 
 (defn prep-config [args]
   (-> args
@@ -29,7 +38,8 @@
   (str (:transport config) "://" (:ip config) ":" (service config)))
 
 (def clojupyter-middleware
-  '[clojupyter.middleware.mime-values/mime-values])
+  '[clojupyter.middleware.mime-values/mime-values
+    clojupyter.middleware.mime-values/wrap-transform-code-with-cljsc-context])
 
 (defn clojupyer-nrepl-handler []
   ;; dynamically load to allow cider-jack-in to work
@@ -42,6 +52,7 @@
 
 (defn start-nrepl-server []
   (nrepl.server/start-server
+   :port (get-free-port!)
    :handler (clojupyer-nrepl-handler)))
 
 (defn exception-handler [e]
@@ -173,6 +184,76 @@
                      (his/end-history-session (:history-session states) 5000)
                      (System/exit 0)
                      )))))))
+
+(defn run-kernel-dont-exit [config killed] ;;exit added again, just run in thread.
+  (let [hb-addr      (address config :hb_port)
+        shell-addr   (address config :shell_port)
+        iopub-addr   (address config :iopub_port)
+        control-addr (address config :control_port)
+        stdin-addr   (address config :stdin_port)
+        key          (:key config)
+        signer       (get-message-signer key)
+        checker      (get-message-checker signer)]
+    (let [states  (states/make-states)
+          context (zmq/context 1)
+          shell-socket   (atom (doto (zmq/socket context :router)
+                                 (zmq/bind shell-addr)))
+          iopub-socket   (atom (doto (zmq/socket context :pub)
+                                 (zmq/bind iopub-addr)))
+          control-socket (atom (doto (zmq/socket context :router)
+                                 (zmq/bind control-addr)))
+          stdin-socket   (atom (doto (zmq/socket context :router)
+                                 (zmq/bind stdin-addr)))
+          hb-socket      (atom (doto (zmq/socket context :rep)
+                                 (zmq/bind hb-addr)))
+          zmq-comm       (zmq-comm/make-zmq-comm shell-socket iopub-socket stdin-socket
+                                                 control-socket hb-socket)]
+      (with-open [nrepl-server    (start-nrepl-server)
+                  nrepl-transport (nrepl/connect :port (:port nrepl-server))]
+        (let [nrepl-client  (nrepl/client nrepl-transport Integer/MAX_VALUE)
+              nrepl-session (nrepl/new-session nrepl-client)
+              nrepl-comm    (nrepl-comm/make-nrepl-comm nrepl-server nrepl-transport
+                                                        nrepl-client nrepl-session)
+              status-sleep  1000]
+          (try
+            (future (shell-loop     states zmq-comm nrepl-comm signer checker))
+            (future (control-loop   states zmq-comm nrepl-comm signer checker))
+            (future (heartbeat-loop states zmq-comm))
+            ;; check every second if state
+            ;; has changed to anything other than alive
+            (while (and @(:alive states) (not @killed)) (Thread/sleep status-sleep))
+            (catch Exception e
+              (exception-handler e))
+            (finally
+              (println "Finally of run-kernel-dont-exit")
+              (doseq [socket [shell-socket iopub-socket control-socket hb-socket]]
+                (zmq/set-linger @socket 0)
+                (zmq/close @socket))
+              (his/end-history-session (:history-session states) 5000)
+              (println "closed sockets")
+              #_(.close context)
+              [states context shell-socket iopub-socket control-socket stdin-socket hb-socket zmq-comm
+               nrepl-server nrepl-session nrepl-comm]
+              #_(System/exit 0)
+              )))))))
+
+(defn start-latest-kernel!
+  ([] (start-latest-kernel!
+       (.getPath
+        (->> (file-seq (clojure.java.io/file "/Users/baruchberger/Library/Jupyter/runtime/"))
+             (sort-by #(.lastModified %))
+             reverse
+             first
+             ))))
+  ([path]
+   (let [killed (atom false)
+         proc (future
+                (run-kernel-dont-exit
+                 (prep-config
+                  [path])
+                 killed
+                 ))]
+     [proc killed])))
 
 (defn -main [& args]
   (log/set-level! :error)

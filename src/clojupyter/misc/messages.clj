@@ -1,5 +1,5 @@
 (ns clojupyter.misc.messages
-  (require
+  (:require
    [cheshire.core :as cheshire]
    [clj-time.core :as time]
    [clj-time.format :as time-format]
@@ -139,15 +139,26 @@
 (defn complete-reply-content
   [nrepl-comm
    message]
-  (let [delimiters #{\( \" \% \space}
+  (let [find-symbol (fn [code]
+                      (loop
+                          [pairs (map-indexed vector (reverse code))
+                           matched ""
+                           delimiter  nil]
+                        (let [character (second (first pairs))
+                              delimiter-map {\( :code
+                                             \" :string
+                                             \% :magic}
+                              delimiter (get delimiter-map character)]
+                          (if (and (not-empty pairs)
+                                   (nil? delimiter))
+                            (recur (rest pairs) (str character matched) delimiter)
+                            [(last (str/split matched #" "))
+                             delimiter]))))
         content (:content message)
         cursor_pos (:cursor_pos content)
         code (subs (:code content) 0 cursor_pos)
-        sym (as-> (reverse code) $
-                  (take-while #(not (contains? delimiters %)) $)
-                  (apply str (reverse $)))]
+        [sym sym_type] (find-symbol code)]
     {:matches (pnrepl/nrepl-complete nrepl-comm sym)
-     :metadata {:_jupyter_types_experimental []}
      :cursor_start (- cursor_pos (count sym))
      :cursor_end cursor_pos
      :status "ok"}))
@@ -207,7 +218,7 @@
   [states zmq-comm nrepl-comm socket message signer]
   (let [parent-header (:header message)
         metadata {}
-        restart (get-in message message [:content :restart])
+        restart (get-in message [:content :restart])
         content {:restart restart :status "ok"}
         session-id (get-in message [:header :session])
         ident (:idents message)
@@ -279,6 +290,9 @@
 
 ;; Handlers
 
+(defn ^:dynamic message->code [message signer]
+  (get-in message [:content :code]))
+
 (defn execute-request-handler
   [states zmq-comm nrepl-comm socket]
   (let [execution-count (atom 1N)]
@@ -286,7 +300,7 @@
       (let [session-id (get-in message [:header :session])
             ident (:idents message)
             parent-header (:header message)
-            code (get-in message [:content :code])
+            code (message->code message signer)
             silent (str/ends-with? code ";")]
         (send-message zmq-comm :iopub-socket "execute_input"
                       (pyin-content @execution-count message)
